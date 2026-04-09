@@ -3,6 +3,35 @@ using PluginSystem.Contracts;
 namespace PluginSystem.Core;
 
 /// <summary>
+/// 插件循环依赖异常
+/// </summary>
+public class PluginCircularDependencyException : Exception
+{
+    /// <summary>
+    /// 完整的循环路径（如 ["A","B","C","A"]）
+    /// </summary>
+    public List<string> CyclePath { get; }
+
+    public PluginCircularDependencyException(List<string> cyclePath)
+        : base($"检测到插件循环依赖: {string.Join(" -> ", cyclePath)}")
+    {
+        CyclePath = cyclePath;
+    }
+
+    public PluginCircularDependencyException(List<string> cyclePath, string message)
+        : base(message)
+    {
+        CyclePath = cyclePath;
+    }
+
+    public PluginCircularDependencyException(List<string> cyclePath, string message, Exception innerException)
+        : base(message, innerException)
+    {
+        CyclePath = cyclePath;
+    }
+}
+
+/// <summary>
 /// 插件加载上下文 - 使用 AssemblyLoadContext 实现插件隔离
 /// 每个插件拥有独立的加载上下文，支持热重载时的程序集卸载
 /// </summary>
@@ -168,7 +197,25 @@ public class PluginManager
         }
 
         // 第二阶段：按依赖关系排序
-        loadedPlugins = SortByDependencies(loadedPlugins);
+        try
+        {
+            loadedPlugins = SortByDependencies(loadedPlugins);
+        }
+        catch (PluginCircularDependencyException ex)
+        {
+            // 获取循环依赖中的插件名（去重，不包含最后重复的那个）
+            var cyclePlugins = ex.CyclePath.Distinct().ToList();
+            _logger.LogWarning("检测到插件循环依赖，将移除这些插件: {CyclePlugins}", 
+                string.Join(", ", cyclePlugins));
+            
+            // 从 loadedPlugins 中移除循环依赖中的插件
+            loadedPlugins = loadedPlugins
+                .Where(p => !cyclePlugins.Contains(p.Plugin.Name))
+                .ToList();
+            
+            // 用剩余插件重新排序
+            loadedPlugins = SortByDependencies(loadedPlugins);
+        }
 
         // 重新组织字典顺序
         lock (_lock)
@@ -192,6 +239,7 @@ public class PluginManager
         var sorted = new List<PluginInfo>();
         var visited = new HashSet<string>();
         var visiting = new HashSet<string>();
+        var path = new List<string>();
 
         void Visit(PluginInfo plugin)
         {
@@ -200,11 +248,18 @@ public class PluginManager
 
             if (visiting.Contains(plugin.Plugin.Name))
             {
-                _logger.LogWarning("检测到循环依赖: {PluginName}", plugin.Plugin.Name);
-                return;
+                var cyclePath = new List<string>();
+                int startIndex = path.IndexOf(plugin.Plugin.Name);
+                for (int i = startIndex; i < path.Count; i++)
+                {
+                    cyclePath.Add(path[i]);
+                }
+                cyclePath.Add(plugin.Plugin.Name);
+                throw new PluginCircularDependencyException(cyclePath);
             }
 
             visiting.Add(plugin.Plugin.Name);
+            path.Add(plugin.Plugin.Name);
 
             // 先处理依赖
             foreach (var depName in plugin.Plugin.Dependencies)
@@ -216,6 +271,7 @@ public class PluginManager
                 }
             }
 
+            path.RemoveAt(path.Count - 1);
             visiting.Remove(plugin.Plugin.Name);
             visited.Add(plugin.Plugin.Name);
             sorted.Add(plugin);
